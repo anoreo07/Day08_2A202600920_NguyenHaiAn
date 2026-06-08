@@ -9,58 +9,94 @@ Yêu cầu:
     - Phải tương thích với embedding model và vector store ở Task 4
 """
 
+import os
+from dotenv import load_dotenv
+import chromadb
+from sentence_transformers import SentenceTransformer
+
+load_dotenv()
+
+# Load model once
+model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
 def semantic_search(query: str, top_k: int = 10) -> list[dict]:
     """
-    Tìm kiếm ngữ nghĩa sử dụng vector similarity.
-
-    Args:
-        query: Câu truy vấn
-        top_k: Số lượng kết quả tối đa
+    Thực hiện semantic search trên vector store.
 
     Returns:
-        List of {
-            'content': str,      # Nội dung chunk
-            'score': float,      # Cosine similarity score
-            'metadata': dict     # source, doc_type, chunk_index
-        }
-        Sorted by score descending.
+        List of {'content': str, 'score': float, 'metadata': dict}
     """
-    # TODO: Implement semantic search
-    #
-    # Bước 1: Embed query bằng cùng model ở Task 4
-    # Bước 2: Query vector store (cosine similarity)
-    # Bước 3: Return top_k results
-    #
-    # Ví dụ với Weaviate:
-    # import weaviate
-    # from sentence_transformers import SentenceTransformer
-    #
-    # model = SentenceTransformer("BAAI/bge-m3")
-    # query_embedding = model.encode(query).tolist()
-    #
-    # client = weaviate.connect_to_local()
-    # collection = client.collections.get("DrugLawDocs")
-    #
-    # results = collection.query.near_vector(
-    #     near_vector=query_embedding,
-    #     limit=top_k,
-    #     return_metadata=MetadataQuery(distance=True)
-    # )
-    #
-    # return [
-    #     {
-    #         "content": obj.properties["content"],
-    #         "score": 1 - obj.metadata.distance,  # distance → similarity
-    #         "metadata": {"source": obj.properties["source"], ...}
-    #     }
-    #     for obj in results.objects
-    # ]
-    raise NotImplementedError("Implement semantic_search")
+    client = chromadb.PersistentClient(path="./chroma_db")
+    collection = client.get_or_create_collection(name="DrugLawDocs")
+    
+    # Embed query
+    query_embedding = model.encode(query).tolist()
+    
+    # Query Chroma
+    results = collection.query(
+        query_embeddings=[query_embedding],
+        n_results=top_k,
+        include=["documents", "metadatas", "distances"]
+    )
+    
+    formatted_results = []
+    if results['documents'] and len(results['documents']) > 0:
+        for doc, meta, dist in zip(results['documents'][0], results['metadatas'][0], results['distances'][0]):
+            # Distance in Chroma is L2 by default, so lower is better. 
+            # We want score where higher is better for common RAG patterns.
+            # L2 distance range is 0 to infinity (usually small for normalized).
+            score = 1.0 / (1.0 + dist)
+            formatted_results.append({
+                "content": doc,
+                "score": score,
+                "metadata": meta
+            })
+            
+    # Sort by score descending
+    formatted_results.sort(key=lambda x: x['score'], reverse=True)
+    
+    return formatted_results
+
+
+def hyde_search(query: str, top_k: int = 10) -> list[dict]:
+    """
+    Hypothetical Document Embeddings (HyDE) search.
+    1. Sinh một câu trả lời giả định (hypothetical answer) từ query.
+    2. Dùng embedding của câu trả lời đó để search.
+    """
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key or api_key == "sk-xxx":
+        print("⚠ Skip HyDE: Missing OPENAI_API_KEY. Falling back to normal semantic search.")
+        return semantic_search(query, top_k)
+
+    from openai import OpenAI
+    client = OpenAI(api_key=api_key)
+    
+    # Generate hypothetical doc
+    hyde_prompt = f"Viết một đoạn văn ngắn (khoảng 100 chữ) trả lời câu hỏi sau một cách kỹ thuật: {query}"
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": hyde_prompt}],
+        temperature=0.7
+    )
+    hypothetical_doc = response.choices[0].message.content
+    print(f"Generated Hypothetical Doc: {hypothetical_doc[:100]}...")
+    
+    # Search using hypothetical doc
+    return semantic_search(hypothetical_doc, top_k)
 
 
 if __name__ == "__main__":
     # Test
-    results = semantic_search("hình phạt cho tội tàng trữ ma tuý", top_k=5)
-    for r in results:
-        print(f"[{r['score']:.3f}] {r['content'][:100]}...")
+    try:
+        print("--- Normal Search ---")
+        results = semantic_search("hình phạt cho tội tàng trữ ma tuý", top_k=3)
+        for r in results:
+            print(f"[{r['score']:.3f}] {r['content'][:100]}...")
+            
+        print("\n--- HyDE Search ---")
+        results = hyde_search("hình phạt cho tội tàng trữ ma tuý", top_k=3)
+        for r in results:
+            print(f"[{r['score']:.3f}] {r['content'][:100]}...")
+    except Exception as e:
+        print(f"Error: {e}")
